@@ -3,6 +3,9 @@ import functools
 import gc
 import os
 import re
+import cv2
+import onnxruntime as ort
+from huggingface_hub import hf_hub_download
 import time
 from typing import List, Optional, Tuple, Union
 from math import ceil
@@ -329,6 +332,58 @@ def resize_and_crop(input_image: PIL.Image.Image, height: int, width: int):
         input_image = input_image.crop((0, top, width, bottom))
     return input_image
 
+def tagger_predict(image, score_threshold):
+    #tagger_model_path = "deepdanbooru.onnx"
+    tagger_model_path = hf_hub_download(repo_id="skytnt/deepdanbooru_onnx", filename="deepdanbooru.onnx")
+    eprovider="CPUExecutionProvider"
+    #eprovider="DmlExecutionProvider"
+    tagger_model = ort.InferenceSession(tagger_model_path, providers=[eprovider])
+    tagger_model_meta = tagger_model.get_modelmeta().custom_metadata_map
+    tagger_tags = eval(tagger_model_meta['tags'])
+    s = 512
+    h, w = image.shape[:-1]
+    h, w = (s, int(s * w / h)) if h > w else (int(s * h / w), s)
+    ph, pw = s - h, s - w
+    image = cv2.resize(image, (w, h), interpolation=cv2.INTER_AREA)
+    image = cv2.copyMakeBorder(image, ph // 2, ph - ph // 2, pw // 2, pw - pw // 2, cv2.BORDER_REPLICATE)
+    image = image.astype(np.float32) / 255
+    image = image[np.newaxis, :]
+    probs = tagger_model.run(None, {"input_1": image})[0][0]
+    probs = probs.astype(np.float32)
+    tags = []
+    probabilities = []
+    for prob, label in zip(probs.tolist(), tagger_tags):
+        if prob < score_threshold:
+            continue
+        tags.append(label)
+        probabilities.append(prob)
+    del tagger_model
+    del tagger_model_meta
+    del tagger_tags
+    gc.collect()
+    return tags, probabilities
+    
+def danbooru_click(extras_image):
+    img = cv2.cvtColor(np.array(extras_image), cv2.COLOR_RGB2BGR)
+    img = img[:, :, ::-1].copy() 
+    dh,dw = img.shape[:-1]
+    tags, probs = tagger_predict(img, 0.5)
+    newprompt = ""
+    for x in tags:
+        if not "rating" in x:
+            newprompt+=(x + ", ")
+    newprompt = newprompt.strip(", ")
+    repdict = {"_": " ", "\\": "\\\\", "(": "\\(" , ")": "\\)"}
+    for key, value in repdict.items():
+        newprompt=newprompt.replace(key,value)
+    print(newprompt)
+    global current_tab
+    if current_tab == 0:
+        return {prompt_t0: newprompt}
+    elif current_tab == 1:
+        return {prompt_t1: newprompt}
+    elif current_tab == 2:
+        return {prompt_t2: newprompt}
 
 def clear_click():
     global current_tab
@@ -882,6 +937,8 @@ if __name__ == "__main__":
             with gr.Column(scale=11, min_width=550):
                 image_out = gr.Gallery(value=None, label="output images")
                 status_out = gr.Textbox(value="", label="status")
+                extras_image = gr.Image(label="input image", type="pil", elem_id="image_extras")
+                danbooru_btn = gr.Button("Deepdanbooru", elem_id="deepdb_button")
 
         # config components
         tab0_inputs = [
@@ -931,9 +988,11 @@ if __name__ == "__main__":
         all_inputs.extend(tab0_inputs)
         all_inputs.extend(tab1_inputs)
         all_inputs.extend(tab2_inputs)
+        all_prompts = [prompt_t0,prompt_t1,prompt_t2]
 
         clear_btn.click(fn=clear_click, inputs=None, outputs=all_inputs, queue=False)
         gen_btn.click(fn=generate_click, inputs=all_inputs, outputs=[image_out, status_out])
+        danbooru_btn.click(fn=danbooru_click, inputs=[extras_image], outputs=all_prompts)
 
         tab0.select(fn=select_tab0, inputs=None, outputs=None)
         tab1.select(fn=select_tab1, inputs=None, outputs=None)
