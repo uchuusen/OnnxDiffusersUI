@@ -27,7 +27,98 @@ from packaging import version
 import PIL
 
 import lpw_pipe
+import torch
+from diffusers.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteSchedulerOutput
+from typing import List, Optional, Tuple, Union
+from diffusers.utils import BaseOutput, logging, randn_tensor
+def step(
+    model_output: torch.FloatTensor,
+    timestep: Union[float, torch.FloatTensor],
+    sample: torch.FloatTensor,
+    generator: Optional[torch.Generator] = None,
+    return_dict: bool = True,
+    ) -> Union[EulerAncestralDiscreteSchedulerOutput, Tuple]:
+    """
+    Predict the sample at the previous timestep by reversing the SDE. Core function to propagate the diffusion
+    process from the learned model outputs (most often the predicted noise).
 
+    Args:
+        model_output (`torch.FloatTensor`): direct output from learned diffusion model.
+        timestep (`float`): current timestep in the diffusion chain.
+        sample (`torch.FloatTensor`):
+            current instance of sample being created by diffusion process.
+        generator (`torch.Generator`, optional): Random number generator.
+        return_dict (`bool`): option for returning tuple rather than EulerAncestralDiscreteSchedulerOutput class
+
+    Returns:
+        [`~schedulers.scheduling_utils.EulerAncestralDiscreteSchedulerOutput`] or `tuple`:
+        [`~schedulers.scheduling_utils.EulerAncestralDiscreteSchedulerOutput`] if `return_dict` is True, otherwise
+        a `tuple`. When returning a tuple, the first element is the sample tensor.
+
+    """
+
+    if (
+        isinstance(timestep, int)
+        or isinstance(timestep, torch.IntTensor)
+        or isinstance(timestep, torch.LongTensor)
+    ):
+        raise ValueError(
+            (
+                "Passing integer indices (e.g. from `enumerate(timesteps)`) as timesteps to"
+                " `EulerDiscreteScheduler.step()` is not supported. Make sure to pass"
+                " one of the `scheduler.timesteps` as a timestep."
+            ),
+        )
+
+    if not pipe.scheduler.is_scale_input_called:
+        logger.warning(
+            "The `scale_model_input` function should be called before `step` to ensure correct denoising. "
+            "See `StableDiffusionPipeline` for a usage example."
+        )
+
+    if isinstance(timestep, torch.Tensor):
+        timestep = timestep.to(pipe.scheduler.timesteps.device)
+
+    step_index = (pipe.scheduler.timesteps == timestep).nonzero().item()
+    sigma = pipe.scheduler.sigmas[step_index]
+
+    # 1. compute predicted original sample (x_0) from sigma-scaled predicted noise
+    if pipe.scheduler.config.prediction_type == "epsilon":
+        pred_original_sample = sample - sigma * model_output
+    elif pipe.scheduler.config.prediction_type == "v_prediction":
+        # * c_out + input * c_skip
+        pred_original_sample = model_output * (-sigma / (sigma**2 + 1) ** 0.5) + (sample / (sigma**2 + 1))
+    else:
+        raise ValueError(
+            f"prediction_type given as {pipe.scheduler.config.prediction_type} must be one of `epsilon`, or `v_prediction`"
+        )
+
+    sigma_from = pipe.scheduler.sigmas[step_index]
+    sigma_to = pipe.scheduler.sigmas[step_index + 1]
+    sigma_up = (sigma_to**2 * (sigma_from**2 - sigma_to**2) / sigma_from**2) ** 0.5
+    sigma_down = (sigma_to**2 - sigma_up**2) ** 0.5
+
+    # 2. Convert to an ODE derivative
+    derivative = (sample - pred_original_sample) / sigma
+
+    dt = sigma_down - sigma
+
+    prev_sample = sample + derivative * dt
+
+    device = model_output.device
+    if generator is None:
+        generator=torch.Generator()
+        generator=generator.manual_seed(31337)
+    noise = randn_tensor(model_output.shape, dtype=model_output.dtype, device=device, generator=generator)
+
+    prev_sample = prev_sample + noise * sigma_up
+
+    if not return_dict:
+        return (prev_sample,)
+
+    return EulerAncestralDiscreteSchedulerOutput(
+        prev_sample=prev_sample, pred_original_sample=pred_original_sample
+    )
 
 # gradio function
 def run_diffusers(
@@ -335,6 +426,7 @@ def generate_click(
         scheduler = EulerDiscreteScheduler.from_pretrained(model_path, subfolder="scheduler")
     elif sched_name == "EulerA" and type(scheduler) is not EulerAncestralDiscreteScheduler:
         scheduler = EulerAncestralDiscreteScheduler.from_pretrained(model_path, subfolder="scheduler")
+        scheduler.step = step
     elif sched_name == "DPMS_ms" and type(scheduler) is not DPMSolverMultistepScheduler:
         scheduler = DPMSolverMultistepScheduler.from_pretrained(model_path, subfolder="scheduler")
     elif sched_name == "DPMS_ss" and type(scheduler) is not DPMSolverSinglestepScheduler:
