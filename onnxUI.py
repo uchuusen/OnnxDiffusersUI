@@ -4,7 +4,7 @@ import gc
 import os
 import re
 import time
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple, Union
 from math import ceil
 
 from diffusers import (
@@ -29,7 +29,6 @@ import PIL
 import lpw_pipe
 import torch
 from diffusers.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteSchedulerOutput
-from typing import List, Optional, Tuple, Union
 from diffusers.utils import BaseOutput, logging, randn_tensor
 def euleragen():
     global euleragenerator
