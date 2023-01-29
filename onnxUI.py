@@ -4,7 +4,7 @@ import gc
 import os
 import re
 import time
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 from math import ceil
 
 from diffusers import (
@@ -29,7 +29,12 @@ import PIL
 import lpw_pipe
 import torch
 from diffusers.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteSchedulerOutput
+from typing import List, Optional, Tuple, Union
 from diffusers.utils import BaseOutput, logging, randn_tensor
+def euleragen():
+    global euleragenerator
+    euleragenerator=torch.Generator()
+    euleragenerator=euleragenerator.manual_seed(31337)
 def step(
     model_output: torch.FloatTensor,
     timestep: Union[float, torch.FloatTensor],
@@ -105,9 +110,8 @@ def step(
     prev_sample = sample + derivative * dt
 
     device = model_output.device
-    if generator is None:
-        generator=torch.Generator()
-        generator=generator.manual_seed(31337)
+
+    generator=euleragenerator
     noise = randn_tensor(model_output.shape, dtype=model_output.dtype, device=device, generator=generator)
 
     prev_sample = prev_sample + noise * sigma_up
@@ -436,7 +440,8 @@ def generate_click(
         scheduler = HeunDiscreteScheduler.from_pretrained(model_path, subfolder="scheduler")
     elif sched_name == "KDPM2" and type(scheduler) is not KDPM2DiscreteScheduler:
         scheduler = KDPM2DiscreteScheduler.from_pretrained(model_path, subfolder="scheduler")
-
+    if type(scheduler) is EulerAncestralDiscreteScheduler:
+        euleragen()
     # select which pipeline depending on current tab
     if current_tab == 0:
         if current_pipe == ("img2img" or "inpaint") and release_memory_on_change:
