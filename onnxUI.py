@@ -3,12 +3,14 @@ import functools
 import gc
 import os
 import re
+import time
 import cv2
 import onnxruntime as ort
 from huggingface_hub import hf_hub_download
-import time
-from typing import List, Optional, Tuple, Union
+import torch
+from typing import Optional, Tuple
 from math import ceil
+from lpw_stable_diffusion_onnx import OnnxStableDiffusionLongPromptWeightingPipeline
 
 from diffusers import (
     OnnxRuntimeModel,
@@ -29,101 +31,7 @@ import numpy as np
 from packaging import version
 import PIL
 
-import lpw_pipe
-import torch
-from diffusers.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteSchedulerOutput
-from diffusers.utils import BaseOutput, logging, randn_tensor
-def euleragen():
-    global euleragenerator
-    euleragenerator=torch.Generator()
-    euleragenerator=euleragenerator.manual_seed(31337)
-def step(
-    model_output: torch.FloatTensor,
-    timestep: Union[float, torch.FloatTensor],
-    sample: torch.FloatTensor,
-    generator: Optional[torch.Generator] = None,
-    return_dict: bool = True,
-    ) -> Union[EulerAncestralDiscreteSchedulerOutput, Tuple]:
-    """
-    Predict the sample at the previous timestep by reversing the SDE. Core function to propagate the diffusion
-    process from the learned model outputs (most often the predicted noise).
 
-    Args:
-        model_output (`torch.FloatTensor`): direct output from learned diffusion model.
-        timestep (`float`): current timestep in the diffusion chain.
-        sample (`torch.FloatTensor`):
-            current instance of sample being created by diffusion process.
-        generator (`torch.Generator`, optional): Random number generator.
-        return_dict (`bool`): option for returning tuple rather than EulerAncestralDiscreteSchedulerOutput class
-
-    Returns:
-        [`~schedulers.scheduling_utils.EulerAncestralDiscreteSchedulerOutput`] or `tuple`:
-        [`~schedulers.scheduling_utils.EulerAncestralDiscreteSchedulerOutput`] if `return_dict` is True, otherwise
-        a `tuple`. When returning a tuple, the first element is the sample tensor.
-
-    """
-
-    if (
-        isinstance(timestep, int)
-        or isinstance(timestep, torch.IntTensor)
-        or isinstance(timestep, torch.LongTensor)
-    ):
-        raise ValueError(
-            (
-                "Passing integer indices (e.g. from `enumerate(timesteps)`) as timesteps to"
-                " `EulerDiscreteScheduler.step()` is not supported. Make sure to pass"
-                " one of the `scheduler.timesteps` as a timestep."
-            ),
-        )
-
-    if not pipe.scheduler.is_scale_input_called:
-        logger.warning(
-            "The `scale_model_input` function should be called before `step` to ensure correct denoising. "
-            "See `StableDiffusionPipeline` for a usage example."
-        )
-
-    if isinstance(timestep, torch.Tensor):
-        timestep = timestep.to(pipe.scheduler.timesteps.device)
-
-    step_index = (pipe.scheduler.timesteps == timestep).nonzero().item()
-    sigma = pipe.scheduler.sigmas[step_index]
-
-    # 1. compute predicted original sample (x_0) from sigma-scaled predicted noise
-    if pipe.scheduler.config.prediction_type == "epsilon":
-        pred_original_sample = sample - sigma * model_output
-    elif pipe.scheduler.config.prediction_type == "v_prediction":
-        # * c_out + input * c_skip
-        pred_original_sample = model_output * (-sigma / (sigma**2 + 1) ** 0.5) + (sample / (sigma**2 + 1))
-    else:
-        raise ValueError(
-            f"prediction_type given as {pipe.scheduler.config.prediction_type} must be one of `epsilon`, or `v_prediction`"
-        )
-
-    sigma_from = pipe.scheduler.sigmas[step_index]
-    sigma_to = pipe.scheduler.sigmas[step_index + 1]
-    sigma_up = (sigma_to**2 * (sigma_from**2 - sigma_to**2) / sigma_from**2) ** 0.5
-    sigma_down = (sigma_to**2 - sigma_up**2) ** 0.5
-
-    # 2. Convert to an ODE derivative
-    derivative = (sample - pred_original_sample) / sigma
-
-    dt = sigma_down - sigma
-
-    prev_sample = sample + derivative * dt
-
-    device = model_output.device
-
-    generator=euleragenerator
-    noise = randn_tensor(model_output.shape, dtype=model_output.dtype, device=device, generator=generator)
-
-    prev_sample = prev_sample + noise * sigma_up
-
-    if not return_dict:
-        return (prev_sample,)
-
-    return EulerAncestralDiscreteSchedulerOutput(
-        prev_sample=prev_sample, pred_original_sample=pred_original_sample
-    )
 
 # gradio function
 def run_diffusers(
@@ -141,11 +49,15 @@ def run_diffusers(
     denoise_strength: Optional[float],
     seed: str,
     image_format: str,
-    legacy: bool
+    legacy: bool,
+    loopback: bool,
 ) -> Tuple[list, str]:
     global model_name
+    global provider
     global current_pipe
     global pipe
+    
+    model_path = os.path.join("model", model_name)
 
     prompt.strip("\n")
     neg_prompt.strip("\n")
@@ -162,6 +74,7 @@ def run_diffusers(
 
     # use given seed for the first iteration
     seeds = np.array([seed], dtype=np.uint32)
+
 
     if iteration_count > 1:
         seed_seq = np.random.SeedSequence(seed)
@@ -184,7 +97,6 @@ def run_diffusers(
     time_taken = 0
     for i in range(iteration_count):
         print(f"iteration {i + 1}/{iteration_count}")
-
         info = (
             f"{next_index + i:06} | "
             f"prompt: {prompt} "
@@ -206,7 +118,9 @@ def run_diffusers(
             log.write(info + "\n")
 
         # create generator object from seed
-        rng = np.random.RandomState(seeds[i])
+        #rng = np.random.RandomState(seeds[i])
+        rng = torch.Generator()
+        rng.manual_seed(int(seeds[i]))
 
         if current_pipe == "txt2img":
             start = time.time()
@@ -219,22 +133,62 @@ def run_diffusers(
                 guidance_scale=guidance_scale,
                 eta=eta,
                 num_images_per_prompt=batch_size,
-                generator=rng).images
+                generator=rng,
+                ancestral_generator=rng).images
             finish = time.time()
         elif current_pipe == "img2img":
+            pipe.vae_encoder = OnnxRuntimeModel.from_pretrained(
+                model_path + "/vae_encoder",provider=provider)
             start = time.time()
-            batch_images = pipe(
-                prompt,
-                negative_prompt=neg_prompt,
-                image=init_image,
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-                eta=eta,
-                strength=denoise_strength,
-                num_images_per_prompt=batch_size,
-                generator=rng).images
+            if loopback is True:
+                try:
+                    loopback_image
+                except UnboundLocalError:
+                    loopback_image = None
+
+                if loopback_image is not None:
+                    batch_images = pipe(
+                        prompt,
+                        negative_prompt=neg_prompt,
+                        image=loopback_image,
+                        num_inference_steps=steps,
+                        guidance_scale=guidance_scale,
+                        eta=eta,
+                        strength=denoise_strength,
+                        num_images_per_prompt=batch_size,
+                        generator=rng,
+                        ancestral_generator=rng,
+                    ).images
+                elif loopback_image is None:
+                    batch_images = pipe(
+                        prompt,
+                        negative_prompt=neg_prompt,
+                        image=init_image,
+                        num_inference_steps=steps,
+                        guidance_scale=guidance_scale,
+                        eta=eta,
+                        strength=denoise_strength,
+                        num_images_per_prompt=batch_size,
+                        generator=rng,
+                        ancestral_generator=rng,
+                    ).images
+            elif loopback is False:
+                batch_images = pipe(
+                    prompt,
+                    negative_prompt=neg_prompt,
+                    image=init_image,
+                    num_inference_steps=steps,
+                    guidance_scale=guidance_scale,
+                    eta=eta,
+                    strength=denoise_strength,
+                    num_images_per_prompt=batch_size,
+                    generator=rng,
+                    ancestral_generator=rng,
+                ).images
             finish = time.time()
         elif current_pipe == "inpaint":
+            pipe.vae_encoder = OnnxRuntimeModel.from_pretrained(
+                model_path + "/vae_encoder",provider=provider)
             start = time.time()
             if legacy is True:
                 batch_images = pipe(
@@ -247,9 +201,10 @@ def run_diffusers(
                     eta=eta,
                     num_images_per_prompt=batch_size,
                     generator=rng,
+                    ancestral_generator=rng,
                 ).images
             else:
-                batch_images = pipe(
+                batch_images = pipe.inpaint_new(
                     prompt,
                     negative_prompt=neg_prompt,
                     image=init_image,
@@ -261,36 +216,67 @@ def run_diffusers(
                     eta=eta,
                     num_images_per_prompt=batch_size,
                     generator=rng,
+                    ancestral_generator=rng,
                 ).images
             finish = time.time()
-
+        if vaedec_on_cpu:
+            pipe.vae_decoder = OnnxRuntimeModel.from_pretrained(
+                model_path + "/vae_decoder")
+        else:
+            pipe.vae_decoder = OnnxRuntimeModel.from_pretrained(
+                model_path + "/vae_decoder",provider=provider)
         short_prompt = prompt.strip("<>:\"/\\|?*\n\t")
         short_prompt = re.sub(r'[\\/*?:"<>|\n\t]', "", short_prompt)
         short_prompt = short_prompt[:99] if len(short_prompt) > 100 else short_prompt
-        
-        # png output
-        if image_format == "png":
-            for j in range(batch_size):
-                batch_images[j].save(
+
+        if loopback is True:
+            loopback_image = batch_images[0]
+
+            # png output
+            if image_format == "png":
+                loopback_image.save(
                     os.path.join(
                         output_path,
-                        f"{next_index + i:06}-{j:02}.{short_prompt}.{image_format}",
+                        f"{next_index + i:06}-00.{short_prompt}.{image_format}",
                     ),
                     optimize=True,
                 )
-        # jpg output
-        elif image_format == "jpg":
-            for j in range(batch_size):
-                batch_images[j].save(
+            # jpg output
+            elif image_format == "jpg":
+                loopback_image.save(
                     os.path.join(
                         output_path,
-                        f"{next_index + i:06}-{j:02}.{short_prompt}.{image_format}",
+                        f"{next_index + i:06}-00.{short_prompt}.{image_format}",
                     ),
                     quality=95,
                     subsampling=0,
                     optimize=True,
                     progressive=True,
                 )
+        elif loopback is False:
+            # png output
+            if image_format == "png":
+                for j in range(batch_size):
+                    batch_images[j].save(
+                        os.path.join(
+                            output_path,
+                            f"{next_index + i:06}-{j:02}.{short_prompt}.{image_format}",
+                        ),
+                        optimize=True,
+                    )
+            # jpg output
+            elif image_format == "jpg":
+                for j in range(batch_size):
+                    batch_images[j].save(
+                        os.path.join(
+                            output_path,
+                            f"{next_index + i:06}-{j:02}.{short_prompt}.{image_format}",
+                        ),
+                        quality=95,
+                        subsampling=0,
+                        optimize=True,
+                        progressive=True,
+                    )
 
         images.extend(batch_images)
         time_taken = time_taken + (finish - start)
@@ -331,7 +317,7 @@ def resize_and_crop(input_image: PIL.Image.Image, height: int, width: int):
         bottom = top + height
         input_image = input_image.crop((0, top, width, bottom))
     return input_image
-
+    
 def tagger_predict(image, score_threshold):
     #tagger_model_path = "deepdanbooru.onnx"
     tagger_model_path = hf_hub_download(repo_id="skytnt/deepdanbooru_onnx", filename="deepdanbooru.onnx")
@@ -377,13 +363,7 @@ def danbooru_click(extras_image):
     for key, value in repdict.items():
         newprompt=newprompt.replace(key,value)
     print(newprompt)
-    global current_tab
-    if current_tab == 0:
-        return {prompt_t0: newprompt}
-    elif current_tab == 1:
-        return {prompt_t1: newprompt}
-    elif current_tab == 2:
-        return {prompt_t2: newprompt}
+    return {prompt_t3: newprompt}
 
 def clear_click():
     global current_tab
@@ -391,7 +371,7 @@ def clear_click():
         return {
             prompt_t0: "",
             neg_prompt_t0: "",
-            sch_t0: "PNDM",
+            sch_t0: "DPMS_ms",
             iter_t0: 1,
             batch_t0: 1,
             steps_t0: 16,
@@ -400,12 +380,13 @@ def clear_click():
             width_t0: 512,
             eta_t0: 0.0,
             seed_t0: "",
-            fmt_t0: "png"}
+            fmt_t0: "png",
+        }
     elif current_tab == 1:
         return {
             prompt_t1: "",
             neg_prompt_t1: "",
-            sch_t1: "PNDM",
+            sch_t1: "DPMS_ms",
             image_t1: None,
             iter_t1: 1,
             batch_t1: 1,
@@ -416,13 +397,15 @@ def clear_click():
             eta_t1: 0.0,
             denoise_t1: 0.8,
             seed_t1: "",
-            fmt_t1: "png"}
+            fmt_t1: "png",
+            loopback_t1: False,
+        }
     elif current_tab == 2:
         return {
             prompt_t2: "",
             neg_prompt_t2: "",
-            sch_t2: "PNDM",
-            legacy_t2: True,
+            sch_t2: "DPMS_ms",
+            legacy_t2: False,
             image_t2: None,
             iter_t2: 1,
             batch_t2: 1,
@@ -432,18 +415,54 @@ def clear_click():
             width_t2: 512,
             eta_t2: 0.0,
             seed_t2: "",
-            fmt_t2: "png"}
+            fmt_t2: "png",
+        }
 
 
 def generate_click(
-    model_drop, prompt_t0, neg_prompt_t0, sch_t0, iter_t0, batch_t0,
-    steps_t0, guid_t0, height_t0, width_t0, eta_t0,
-    seed_t0, fmt_t0, prompt_t1, neg_prompt_t1, image_t1, sch_t1, iter_t1,
-    batch_t1, steps_t1, guid_t1, height_t1,
-    width_t1, eta_t1, denoise_t1, seed_t1, fmt_t1, prompt_t2,
-    neg_prompt_t2, sch_t2, legacy_t2, image_t2, iter_t2,
-    batch_t2, steps_t2, guid_t2, height_t2, width_t2, eta_t2, seed_t2,
-    fmt_t2
+    model_drop,
+    prompt_t0,
+    neg_prompt_t0,
+    sch_t0,
+    iter_t0,
+    batch_t0,
+    steps_t0,
+    guid_t0,
+    height_t0,
+    width_t0,
+    eta_t0,
+    seed_t0,
+    fmt_t0,
+    prompt_t1,
+    neg_prompt_t1,
+    image_t1,
+    sch_t1,
+    iter_t1,
+    batch_t1,
+    steps_t1,
+    guid_t1,
+    height_t1,
+    width_t1,
+    eta_t1,
+    denoise_t1,
+    seed_t1,
+    fmt_t1,
+    loopback_t1,
+    prompt_t2,
+    neg_prompt_t2,
+    sch_t2,
+    legacy_t2,
+    image_t2,
+    iter_t2,
+    batch_t2,
+    steps_t2,
+    guid_t2,
+    height_t2,
+    width_t2,
+    eta_t2,
+    seed_t2,
+    fmt_t2,
+    prompt_t3,
 ):
     global model_name
     global provider
@@ -483,7 +502,6 @@ def generate_click(
         scheduler = EulerDiscreteScheduler.from_pretrained(model_path, subfolder="scheduler")
     elif sched_name == "EulerA" and type(scheduler) is not EulerAncestralDiscreteScheduler:
         scheduler = EulerAncestralDiscreteScheduler.from_pretrained(model_path, subfolder="scheduler")
-        scheduler.step = step
     elif sched_name == "DPMS_ms" and type(scheduler) is not DPMSolverMultistepScheduler:
         scheduler = DPMSolverMultistepScheduler.from_pretrained(model_path, subfolder="scheduler")
     elif sched_name == "DPMS_ss" and type(scheduler) is not DPMSolverSinglestepScheduler:
@@ -494,20 +512,16 @@ def generate_click(
         scheduler = HeunDiscreteScheduler.from_pretrained(model_path, subfolder="scheduler")
     elif sched_name == "KDPM2" and type(scheduler) is not KDPM2DiscreteScheduler:
         scheduler = KDPM2DiscreteScheduler.from_pretrained(model_path, subfolder="scheduler")
-    if type(scheduler) is EulerAncestralDiscreteScheduler:
-        euleragen()
+
     # select which pipeline depending on current tab
     if current_tab == 0:
-        if current_pipe == ("img2img" or "inpaint") and release_memory_on_change:
-            pipe = None
-            gc.collect()
-        if current_pipe != "txt2img" or pipe is None:
+        if pipe is None:
             if textenc_on_cpu and vaedec_on_cpu:
                 cputextenc = OnnxRuntimeModel.from_pretrained(
                     model_path + "/text_encoder")
                 cpuvaedec = OnnxRuntimeModel.from_pretrained(
                     model_path + "/vae_decoder")
-                pipe = OnnxStableDiffusionPipeline.from_pretrained(
+                pipe = OnnxStableDiffusionLongPromptWeightingPipeline.from_pretrained(
                     model_path,
                     provider=provider,
                     scheduler=scheduler,
@@ -518,7 +532,7 @@ def generate_click(
             elif textenc_on_cpu:
                 cputextenc = OnnxRuntimeModel.from_pretrained(
                     model_path + "/text_encoder")
-                pipe = OnnxStableDiffusionPipeline.from_pretrained(
+                pipe = OnnxStableDiffusionLongPromptWeightingPipeline.from_pretrained(
                     model_path,
                     provider=provider,
                     scheduler=scheduler,
@@ -526,7 +540,7 @@ def generate_click(
             elif vaedec_on_cpu:
                 cpuvaedec = OnnxRuntimeModel.from_pretrained(
                     model_path + "/vae_decoder")
-                pipe = OnnxStableDiffusionPipeline.from_pretrained(
+                pipe = OnnxStableDiffusionLongPromptWeightingPipeline.from_pretrained(
                     model_path,
                     provider=provider,
                     scheduler=scheduler,
@@ -534,22 +548,19 @@ def generate_click(
                     vae_encoder=None
                 )
             else:
-                pipe = OnnxStableDiffusionPipeline.from_pretrained(
+                pipe = OnnxStableDiffusionLongPromptWeightingPipeline.from_pretrained(
                     model_path,
                     provider=provider,
                     scheduler=scheduler)
         current_pipe = "txt2img"
     elif current_tab == 1:
-        if current_pipe == ("txt2img" or "inpaint") and release_memory_on_change:
-            pipe = None
-            gc.collect()
-        if current_pipe != "img2img" or pipe is None:
+        if pipe is None:
             if textenc_on_cpu and vaedec_on_cpu:
                 cputextenc = OnnxRuntimeModel.from_pretrained(
                     model_path + "/text_encoder")
                 cpuvaedec = OnnxRuntimeModel.from_pretrained(
                     model_path + "/vae_decoder")
-                pipe = OnnxStableDiffusionImg2ImgPipeline.from_pretrained(
+                pipe = OnnxStableDiffusionLongPromptWeightingPipeline.from_pretrained(
                     model_path,
                     provider=provider,
                     scheduler=scheduler,
@@ -558,7 +569,7 @@ def generate_click(
             elif textenc_on_cpu:
                 cputextenc = OnnxRuntimeModel.from_pretrained(
                     model_path + "/text_encoder")
-                pipe = OnnxStableDiffusionImg2ImgPipeline.from_pretrained(
+                pipe = OnnxStableDiffusionLongPromptWeightingPipeline.from_pretrained(
                     model_path,
                     provider=provider,
                     scheduler=scheduler,
@@ -566,29 +577,26 @@ def generate_click(
             elif vaedec_on_cpu:
                 cpuvaedec = OnnxRuntimeModel.from_pretrained(
                     model_path + "/vae_decoder")
-                pipe = OnnxStableDiffusionImg2ImgPipeline.from_pretrained(
+                pipe = OnnxStableDiffusionLongPromptWeightingPipeline.from_pretrained(
                     model_path,
                     provider=provider,
                     scheduler=scheduler,
                     vae_decoder=cpuvaedec)
             else:
-                pipe = OnnxStableDiffusionImg2ImgPipeline.from_pretrained(
+                pipe = OnnxStableDiffusionLongPromptWeightingPipeline.from_pretrained(
                     model_path,
                     provider=provider,
                     scheduler=scheduler)
         current_pipe = "img2img"
     elif current_tab == 2:
-        if current_pipe == ("txt2img" or "img2img") and release_memory_on_change:
-            pipe = None
-            gc.collect()
-        if current_pipe != "inpaint" or pipe is None or current_legacy != legacy_t2:
+        if pipe is None:
             if legacy_t2:
                 if textenc_on_cpu and vaedec_on_cpu:
                     cputextenc = OnnxRuntimeModel.from_pretrained(
                         model_path + "/text_encoder")
                     cpuvaedec = OnnxRuntimeModel.from_pretrained(
                         model_path + "/vae_decoder")
-                    pipe = OnnxStableDiffusionInpaintPipelineLegacy.from_pretrained(
+                    pipe = OnnxStableDiffusionLongPromptWeightingPipeline.from_pretrained(
                         model_path,
                         provider=provider,
                         scheduler=scheduler,
@@ -597,7 +605,7 @@ def generate_click(
                 elif textenc_on_cpu:
                     cputextenc = OnnxRuntimeModel.from_pretrained(
                         model_path + "/text_encoder")
-                    pipe = OnnxStableDiffusionInpaintPipelineLegacy.from_pretrained(
+                    pipe = OnnxStableDiffusionLongPromptWeightingPipeline.from_pretrained(
                         model_path,
                         provider=provider,
                         scheduler=scheduler,
@@ -605,13 +613,13 @@ def generate_click(
                 elif vaedec_on_cpu:
                     cpuvaedec = OnnxRuntimeModel.from_pretrained(
                         model_path + "/vae_decoder")
-                    pipe = OnnxStableDiffusionInpaintPipelineLegacy.from_pretrained(
+                    pipe = OnnxStableDiffusionLongPromptWeightingPipeline.from_pretrained(
                         model_path,
                         provider=provider,
                         scheduler=scheduler,
                         vae_decoder=cpuvaedec)
                 else:
-                    pipe = OnnxStableDiffusionInpaintPipelineLegacy.from_pretrained(
+                    pipe = OnnxStableDiffusionLongPromptWeightingPipeline.from_pretrained(
                         model_path,
                         provider=provider,
                         scheduler=scheduler)
@@ -621,7 +629,7 @@ def generate_click(
                         model_path + "/text_encoder")
                     cpuvaedec = OnnxRuntimeModel.from_pretrained(
                         model_path + "/vae_decoder")
-                    pipe = OnnxStableDiffusionInpaintPipeline.from_pretrained(
+                    pipe = OnnxStableDiffusionLongPromptWeightingPipeline.from_pretrained(
                         model_path,
                         provider=provider,
                         scheduler=scheduler,
@@ -630,7 +638,7 @@ def generate_click(
                 elif textenc_on_cpu:
                     cputextenc = OnnxRuntimeModel.from_pretrained(
                         model_path + "/text_encoder")
-                    pipe = OnnxStableDiffusionInpaintPipeline.from_pretrained(
+                    pipe = OnnxStableDiffusionLongPromptWeightingPipeline.from_pretrained(
                         model_path,
                         provider=provider,
                         scheduler=scheduler,
@@ -638,13 +646,13 @@ def generate_click(
                 elif vaedec_on_cpu:
                     cpuvaedec = OnnxRuntimeModel.from_pretrained(
                         model_path + "/vae_decoder")
-                    pipe = OnnxStableDiffusionInpaintPipeline.from_pretrained(
+                    pipe = OnnxStableDiffusionLongPromptWeightingPipeline.from_pretrained(
                         model_path,
                         provider=provider,
                         scheduler=scheduler,
                         vae_decoder=cpuvaedec)
                 else:
-                    pipe = OnnxStableDiffusionInpaintPipeline.from_pretrained(
+                    pipe = OnnxStableDiffusionLongPromptWeightingPipeline.from_pretrained(
                         model_path,
                         provider=provider,
                         scheduler=scheduler)
@@ -662,7 +670,6 @@ def generate_click(
     else:
         safety_checker = lambda images, **kwargs: (images, [False] * len(images))
     pipe.safety_checker = safety_checker
-    pipe._encode_prompt = functools.partial(lpw_pipe._encode_prompt, pipe)
 
     # run the pipeline with the correct parameters
     if current_tab == 0:
@@ -681,7 +688,9 @@ def generate_click(
             0,
             seed_t0,
             fmt_t0,
-            None)
+            None,
+            False,
+        )
     elif current_tab == 1:
         # input image resizing
         input_image = image_t1.convert("RGB")
@@ -690,7 +699,7 @@ def generate_click(
         # adjust steps to account for denoise.
         steps_t1_old = steps_t1
         steps_t1 = ceil(steps_t1 / denoise_t1)
-        if steps_t1 > 1000 and sch_t1 == "DPMS":
+        if steps_t1 > 1000 and (sch_t1 == "DPMS_ms" or "DPMS_ss" or "DEIS"):
             steps_t1_unreduced = steps_t1
             steps_t1 = 1000
             print()
@@ -702,7 +711,7 @@ def generate_click(
             )
             print()
             print(
-                f"INTERNAL STEP COUNT EXCEEDS 1000 MAX FOR DPMS. INTERNAL STEPS WILL BE REDUCED TO 1000."
+                f"INTERNAL STEP COUNT EXCEEDS 1000 MAX FOR DPMS_ms, DPMS_ss, or DEIS. INTERNAL STEPS WILL BE REDUCED TO 1000."
             )
             print()
         else:
@@ -730,7 +739,11 @@ def generate_click(
             denoise_t1,
             seed_t1,
             fmt_t1,
-            None)
+            None,
+            loopback_t1,
+        )
+        pipe.vae_encoder = OnnxRuntimeModel.from_pretrained(
+            model_path + "/vae_encoder",provider=provider)
     elif current_tab == 2:
         input_image = image_t2["image"].convert("RGB")
         input_image = resize_and_crop(input_image, height_t2, width_t2)
@@ -769,12 +782,21 @@ def generate_click(
             0,
             seed_t2,
             fmt_t2,
-            legacy_t2)
+            legacy_t2,
+            False,
+        )
+        #pipe.vae_encoder = OnnxRuntimeModel.from_pretrained(
+        #    model_path + "/vae_encoder",provider=provider)
 
     if release_memory_after_generation:
         pipe = None
         gc.collect()
-
+    #if vaedec_on_cpu:
+    #    pipe.vae_decoder = OnnxRuntimeModel.from_pretrained(
+    #        model_path + "/vae_decoder")
+    #else:
+    #    pipe.vae_decoder = OnnxRuntimeModel.from_pretrained(
+     #       model_path + "/vae_decoder",provider=provider)
     return images, status
 
 
@@ -791,6 +813,10 @@ def select_tab1():
 def select_tab2():
     global current_tab
     current_tab = 2
+    
+def select_tab3():
+    global current_tab
+    current_tab = 3
 
 
 def choose_sch(sched_name: str):
@@ -871,7 +897,7 @@ if __name__ == "__main__":
             HeunDiscreteScheduler,
             KDPM2DiscreteScheduler
         )
-        sched_list = ["DPMS_ms", "DPMS_ss", "EulerA", "Euler", "DDIM", "LMS", "PNDM","DEIS","HEUN","KDPM2"]
+        sched_list = ["DPMS_ms", "DPMS_ss", "EulerA", "Euler", "DDIM", "LMS", "PNDM", "DEIS", "HEUN", "KDPM2"]
     else:
         sched_list = ["DPMS_ms", "EulerA", "Euler", "DDIM", "LMS", "PNDM"]
 
@@ -890,29 +916,31 @@ if __name__ == "__main__":
                 with gr.Tab(label="txt2img") as tab0:
                     prompt_t0 = gr.Textbox(value="", lines=2, label="prompt")
                     neg_prompt_t0 = gr.Textbox(value="", lines=2, label="negative prompt")
-                    sch_t0 = gr.Radio(sched_list, value="PNDM", label="scheduler")
+                    sch_t0 = gr.Radio(sched_list, value="DPMS_ms", label="scheduler")
                     with gr.Row():
                         iter_t0 = gr.Slider(1, 24, value=1, step=1, label="iteration count")
                         batch_t0 = gr.Slider(1, 4, value=1, step=1, label="batch size")
                     steps_t0 = gr.Slider(1, 300, value=16, step=1, label="steps")
                     guid_t0 = gr.Slider(0, 50, value=7.5, step=0.1, label="guidance")
-                    height_t0 = gr.Slider(384, 960, value=512, step=64, label="height")
-                    width_t0 = gr.Slider(384, 960, value=512, step=64, label="width")
+                    height_t0 = gr.Slider(192, 1536, value=512, step=64, label="height")
+                    width_t0 = gr.Slider(192, 1536, value=512, step=64, label="width")
                     eta_t0 = gr.Slider(0, 1, value=0.0, step=0.01, label="DDIM eta", interactive=False)
                     seed_t0 = gr.Textbox(value="", max_lines=1, label="seed")
                     fmt_t0 = gr.Radio(["png", "jpg"], value="png", label="image format")
                 with gr.Tab(label="img2img") as tab1:
                     prompt_t1 = gr.Textbox(value="", lines=2, label="prompt")
                     neg_prompt_t1 = gr.Textbox(value="", lines=2, label="negative prompt")
-                    sch_t1 = gr.Radio(sched_list, value="PNDM", label="scheduler")
+                    sch_t1 = gr.Radio(sched_list, value="DPMS_ms", label="scheduler")
                     image_t1 = gr.Image(label="input image", type="pil", elem_id="image_init")
                     with gr.Row():
                         iter_t1 = gr.Slider(1, 24, value=1, step=1, label="iteration count")
                         batch_t1 = gr.Slider(1, 4, value=1, step=1, label="batch size")
+                    with gr.Row():
+                        loopback_t1 = gr.Checkbox(value=False, label="loopback (use iteration count)")
                     steps_t1 = gr.Slider(1, 300, value=16, step=1, label="steps")
                     guid_t1 = gr.Slider(0, 50, value=7.5, step=0.1, label="guidance")
-                    height_t1 = gr.Slider(384, 960, value=512, step=64, label="height")
-                    width_t1 = gr.Slider(384, 960, value=512, step=64, label="width")
+                    height_t1 = gr.Slider(192, 1536, value=512, step=64, label="height")
+                    width_t1 = gr.Slider(192, 1536, value=512, step=64, label="width")
                     eta_t1 = gr.Slider(0, 1, value=0.0, step=0.01, label="DDIM eta", interactive=False)
                     denoise_t1 = gr.Slider(0, 1, value=0.8, step=0.01, label="denoise strength")
                     seed_t1 = gr.Textbox(value="", max_lines=1, label="seed")
@@ -920,7 +948,7 @@ if __name__ == "__main__":
                 with gr.Tab(label="inpainting") as tab2:
                     prompt_t2 = gr.Textbox(value="", lines=2, label="prompt")
                     neg_prompt_t2 = gr.Textbox(value="", lines=2, label="negative prompt")
-                    sch_t2 = gr.Radio(sched_list, value="PNDM", label="scheduler")
+                    sch_t2 = gr.Radio(sched_list, value="DPMS_ms", label="scheduler")
                     legacy_t2 = gr.Checkbox(value=False, label="legacy inpaint")
                     image_t2 = gr.Image(
                         source="upload", tool="sketch", label="input image", type="pil", elem_id="image_inpaint")
@@ -929,16 +957,18 @@ if __name__ == "__main__":
                         batch_t2 = gr.Slider(1, 4, value=1, step=1, label="batch size")
                     steps_t2 = gr.Slider(1, 300, value=16, step=1, label="steps")
                     guid_t2 = gr.Slider(0, 50, value=7.5, step=0.1, label="guidance")
-                    height_t2 = gr.Slider(384, 960, value=512, step=64, label="height")
-                    width_t2 = gr.Slider(384, 960, value=512, step=64, label="width")
+                    height_t2 = gr.Slider(192, 1536, value=512, step=64, label="height")
+                    width_t2 = gr.Slider(192, 1536, value=512, step=64, label="width")
                     eta_t2 = gr.Slider(0, 1, value=0.0, step=0.01, label="DDIM eta", interactive=False)
                     seed_t2 = gr.Textbox(value="", max_lines=1, label="seed")
                     fmt_t2 = gr.Radio(["png", "jpg"], value="png", label="image format")
+                with gr.Tab(label="extras") as tab3:
+                    prompt_t3 = gr.Textbox(value="", lines=2, label="prompt")
+                    extras_image = gr.Image(label="input image", type="pil", elem_id="image_extras")
+                    danbooru_btn = gr.Button("Deepdanbooru", elem_id="deepdb_button")
             with gr.Column(scale=11, min_width=550):
                 image_out = gr.Gallery(value=None, label="output images")
                 status_out = gr.Textbox(value="", label="status")
-                extras_image = gr.Image(label="input image", type="pil", elem_id="image_extras")
-                danbooru_btn = gr.Button("Deepdanbooru", elem_id="deepdb_button")
 
         # config components
         tab0_inputs = [
@@ -953,7 +983,8 @@ if __name__ == "__main__":
             width_t0,
             eta_t0,
             seed_t0,
-            fmt_t0]
+            fmt_t0,
+        ]
         tab1_inputs = [
             prompt_t1,
             neg_prompt_t1,
@@ -968,7 +999,9 @@ if __name__ == "__main__":
             eta_t1,
             denoise_t1,
             seed_t1,
-            fmt_t1]
+            fmt_t1,
+            loopback_t1,
+        ]
         tab2_inputs = [
             prompt_t2,
             neg_prompt_t2,
@@ -983,12 +1016,17 @@ if __name__ == "__main__":
             width_t2,
             eta_t2,
             seed_t2,
-            fmt_t2]
+            fmt_t2,
+        ]
+        tab3_inputs = [
+            prompt_t3,
+        ]
         all_inputs = [model_drop]
         all_inputs.extend(tab0_inputs)
         all_inputs.extend(tab1_inputs)
         all_inputs.extend(tab2_inputs)
-        all_prompts = [prompt_t0,prompt_t1,prompt_t2]
+        all_inputs.extend(tab3_inputs)
+        all_prompts = [prompt_t0,prompt_t1,prompt_t2,prompt_t3]
 
         clear_btn.click(fn=clear_click, inputs=None, outputs=all_inputs, queue=False)
         gen_btn.click(fn=generate_click, inputs=all_inputs, outputs=[image_out, status_out])
@@ -997,6 +1035,7 @@ if __name__ == "__main__":
         tab0.select(fn=select_tab0, inputs=None, outputs=None)
         tab1.select(fn=select_tab1, inputs=None, outputs=None)
         tab2.select(fn=select_tab2, inputs=None, outputs=None)
+        tab3.select(fn=select_tab3, inputs=None, outputs=None)
 
         sch_t0.change(fn=choose_sch, inputs=sch_t0, outputs=eta_t0, queue=False)
         sch_t1.change(fn=choose_sch, inputs=sch_t1, outputs=eta_t1, queue=False)
