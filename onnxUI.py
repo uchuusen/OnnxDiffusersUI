@@ -1,5 +1,6 @@
 import argparse
 import functools
+import pandas as pd
 import gc
 import os
 import re
@@ -10,7 +11,11 @@ from huggingface_hub import hf_hub_download
 import torch
 from typing import Optional, Tuple
 from math import ceil
+import lpw_pipe
 from lpw_stable_diffusion_onnx import OnnxStableDiffusionLongPromptWeightingPipeline
+from pipeline_onnx_stable_diffusion_controlnet import OnnxStableDiffusionControlNetPipeline
+from controlnet_aux import OpenposeDetector, HEDdetector
+from transformers import pipeline
 
 from diffusers import (
     OnnxRuntimeModel,
@@ -23,7 +28,8 @@ from diffusers import (
     LMSDiscreteScheduler,
     EulerDiscreteScheduler,
     EulerAncestralDiscreteScheduler,
-    DPMSolverMultistepScheduler
+    DPMSolverMultistepScheduler,
+    UniPCMultistepScheduler,
 )
 from diffusers import __version__ as _df_version
 import gradio as gr
@@ -31,7 +37,7 @@ import numpy as np
 from packaging import version
 import PIL
 
-
+    
 
 # gradio function
 def run_diffusers(
@@ -51,11 +57,16 @@ def run_diffusers(
     image_format: str,
     legacy: bool,
     loopback: bool,
+    preprocess: bool,
 ) -> Tuple[list, str]:
     global model_name
+    global controlnet_name
     global provider
     global current_pipe
     global pipe
+    global controlnet
+    global callbackcounter
+    callbackcounter = 9
     
     model_path = os.path.join("model", model_name)
 
@@ -121,6 +132,7 @@ def run_diffusers(
         #rng = np.random.RandomState(seeds[i])
         rng = torch.Generator()
         rng.manual_seed(int(seeds[i]))
+        rng_cnet = np.random.RandomState(seeds[i])
 
         if current_pipe == "txt2img":
             start = time.time()
@@ -218,6 +230,51 @@ def run_diffusers(
                     generator=rng,
                     ancestral_generator=rng,
                 ).images
+            finish = time.time()
+        elif current_pipe == "controlnet":
+            if preprocess:
+                cnet_image=init_image
+                print("no preprocessing")
+            else:
+                if controlnet_type == "canny":
+                    image = np.array(init_image)
+                    low_threshold = 100
+                    high_threshold = 200
+
+                    image = cv2.Canny(image, low_threshold, high_threshold)
+                    image = image[:, :, None]
+                    image = np.concatenate([image, image, image], axis=2)
+                    cnet_image = PIL.Image.fromarray(image)
+                elif controlnet_type == "openpose":
+                    openpose = OpenposeDetector.from_pretrained('lllyasviel/ControlNet')
+                    cnet_image = openpose(init_image)
+                    del openpose
+                    gc.collect() 
+                elif controlnet_type == "scribble":
+                    hed = HEDdetector.from_pretrained('lllyasviel/ControlNet')
+                    cnet_image = hed(init_image, scribble=True)
+                    del hed
+                    gc.collect()   
+                elif controlnet_type == "depth":
+                    depth_estimator = pipeline('depth-estimation')
+                    image = depth_estimator(image)['depth']
+                    image = np.array(image)
+                    image = image[:, :, None]
+                    image = np.concatenate([image, image, image], axis=2)
+                    cnet_image = PIL.Image.fromarray(image)
+                cnet_image.save("./tmp.png")
+            start = time.time()
+            batch_images = pipe(
+                prompt,
+                negative_prompt=neg_prompt,
+                image=cnet_image,
+                height=height,
+                width=width,
+                num_inference_steps=steps,
+                guidance_scale=guidance_scale,
+                eta=eta,
+                num_images_per_prompt=batch_size,
+                generator=rng_cnet).images
             finish = time.time()
         if vaedec_on_cpu:
             pipe.vae_decoder = OnnxRuntimeModel.from_pretrained(
@@ -318,51 +375,95 @@ def resize_and_crop(input_image: PIL.Image.Image, height: int, width: int):
         input_image = input_image.crop((0, top, width, bottom))
     return input_image
     
-def tagger_predict(image, score_threshold):
-    #tagger_model_path = "deepdanbooru.onnx"
-    tagger_model_path = hf_hub_download(repo_id="skytnt/deepdanbooru_onnx", filename="deepdanbooru.onnx")
-    eprovider="CPUExecutionProvider"
-    #eprovider="DmlExecutionProvider"
-    tagger_model = ort.InferenceSession(tagger_model_path, providers=[eprovider])
-    tagger_model_meta = tagger_model.get_modelmeta().custom_metadata_map
-    tagger_tags = eval(tagger_model_meta['tags'])
-    s = 512
-    h, w = image.shape[:-1]
-    h, w = (s, int(s * w / h)) if h > w else (int(s * h / w), s)
-    ph, pw = s - h, s - w
-    image = cv2.resize(image, (w, h), interpolation=cv2.INTER_AREA)
-    image = cv2.copyMakeBorder(image, ph // 2, ph - ph // 2, pw // 2, pw - pw // 2, cv2.BORDER_REPLICATE)
-    image = image.astype(np.float32) / 255
-    image = image[np.newaxis, :]
-    probs = tagger_model.run(None, {"input_1": image})[0][0]
-    probs = probs.astype(np.float32)
-    tags = []
-    probabilities = []
-    for prob, label in zip(probs.tolist(), tagger_tags):
-        if prob < score_threshold:
-            continue
-        tags.append(label)
-        probabilities.append(prob)
-    del tagger_model
-    del tagger_model_meta
-    del tagger_tags
-    gc.collect()
-    return tags, probabilities
+    
+    
+def make_square(img, target_size):
+    old_size = img.shape[:2]
+    desired_size = max(old_size)
+    desired_size = max(desired_size, target_size)
+
+    delta_w = desired_size - old_size[1]
+    delta_h = desired_size - old_size[0]
+    top, bottom = delta_h // 2, delta_h - (delta_h // 2)
+    left, right = delta_w // 2, delta_w - (delta_w // 2)
+
+    color = [255, 255, 255]
+    new_im = cv2.copyMakeBorder(
+        img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color
+    )
+    return new_im
+    
+def smart_resize(img, size):
+    # Assumes the image has already gone through make_square
+    if img.shape[0] > size:
+        img = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
+    elif img.shape[0] < size:
+        img = cv2.resize(img, (size, size), interpolation=cv2.INTER_CUBIC)
+    return img
     
 def danbooru_click(extras_image):
-    img = cv2.cvtColor(np.array(extras_image), cv2.COLOR_RGB2BGR)
-    img = img[:, :, ::-1].copy() 
-    dh,dw = img.shape[:-1]
-    tags, probs = tagger_predict(img, 0.5)
+
+    tagger_model_path = hf_hub_download(repo_id="SmilingWolf/wd-v1-4-vit-tagger-v2", revision='v2.0', filename="model.onnx")
+    tags_path = hf_hub_download(repo_id="SmilingWolf/wd-v1-4-vit-tagger-v2", revision='v2.0', filename="selected_tags.csv")
+
+    opts = ort.SessionOptions()
+    opts.enable_cpu_mem_arena = False
+    opts.enable_mem_pattern = False
+    tagger_model = ort.InferenceSession(tagger_model_path, sess_options=opts, providers=['DmlExecutionProvider', 'CPUExecutionProvider'])
+    modeltags = pd.read_csv(tags_path)
+    _, height, _, _ = tagger_model.get_inputs()[0].shape
+    
+    image = extras_image.convert("RGBA")
+    new_image = PIL.Image.new('RGBA', image.size, 'WHITE')
+    new_image.paste(image, mask=image)
+    image = new_image.convert('RGB')
+    image = np.asarray(image)
+    
+    # PIL RGB to OpenCV BGR
+    image = image[:, :, ::-1]
+    
+    image = make_square(image, height)
+    image = smart_resize(image, height)
+    image = image.astype(np.float32)
+    image = np.expand_dims(image, 0)
+    
+    input_name = tagger_model.get_inputs()[0].name
+    label_name = tagger_model.get_outputs()[0].name
+    confidents = tagger_model.run([label_name], {input_name: image})[0]
+    
+    tags = modeltags[:][['name']]
+    tags['confidents'] = confidents[0]
+
+    # first 4 items are for rating (general, sensitive, questionable, explicit)
+    ratings = dict(tags[:4].values)
+
+    # rest are regular tags
+    tags = dict(tags[4:].values)
+    
+    keys = list(ratings.keys())
+    values = list(ratings.values())
+    sorted_value_index = np.argsort(values)[::-1]
+    sortedratings = {keys[i]: values[i] for i in sorted_value_index}
+
+    print(sortedratings)
+    
+    keys = list(tags.keys())
+    values = list(tags.values())
+    sorted_value_index = np.argsort(values)[::-1]
+    sortedtags = {keys[i]: values[i] for i in sorted_value_index}
+    
     newprompt = ""
-    for x in tags:
-        if not "rating" in x:
+    for x in sortedtags:
+        if sortedtags[x] >= 0.35:
             newprompt+=(x + ", ")
     newprompt = newprompt.strip(", ")
     repdict = {"_": " ", "\\": "\\\\", "(": "\\(" , ")": "\\)"}
     for key, value in repdict.items():
         newprompt=newprompt.replace(key,value)
+
     print(newprompt)
+    del tagger_model
+    gc.collect()
     return {prompt_t3: newprompt}
 
 def clear_click():
@@ -417,10 +518,28 @@ def clear_click():
             seed_t2: "",
             fmt_t2: "png",
         }
+    elif current_tab == 4:
+        return {
+            prompt_t4: "",
+            neg_prompt_t4: "",
+            sch_t4: "DPMS_ms",
+            preprocess_t4: False,
+            image_t4: None, 
+            iter_t4: 1,
+            batch_t4: 1,
+            steps_t4: 16,
+            guid_t4: 7.5,
+            height_t4: 512,
+            width_t4: 512,
+            eta_t4: 0.0,
+            seed_t4: "",
+            fmt_t4: "png",
+        }
 
 
 def generate_click(
     model_drop,
+    controlnet_drop,
     prompt_t0,
     neg_prompt_t0,
     sch_t0,
@@ -463,8 +582,23 @@ def generate_click(
     seed_t2,
     fmt_t2,
     prompt_t3,
+    prompt_t4,
+    neg_prompt_t4,
+    image_t4,
+    sch_t4,
+    preprocess_t4,
+    iter_t4,
+    batch_t4,
+    steps_t4,
+    guid_t4,
+    height_t4,
+    width_t4,
+    eta_t4,
+    seed_t4,
+    fmt_t4,
 ):
     global model_name
+    global controlnet_name
     global provider
     global current_tab
     global current_pipe
@@ -472,7 +606,9 @@ def generate_click(
     global release_memory_after_generation
     global release_memory_on_change
     global scheduler
+    global controlnet_type
     global pipe
+    global controlnet
 
     # reset scheduler and pipeline if model is different
     if model_name != model_drop:
@@ -481,6 +617,20 @@ def generate_click(
         pipe = None
         gc.collect()
     model_path = os.path.join("model", model_name)
+    
+    if controlnet_name != controlnet_drop:
+        controlnet_name = controlnet_drop
+        controlnet = None
+        #scheduler = None
+        #pipe = None
+        gc.collect()
+    controlnet_path = os.path.join("controlnet", controlnet_name)
+    if "canny" in controlnet_name:
+        controlnet_type = "canny"
+    elif "openpose" in controlnet_name:
+        controlnet_type = "openpose"
+    elif "scribble" in controlnet_name:
+        controlnet_type = "scribble"
 
     # select which scheduler depending on current tab
     if current_tab == 0:
@@ -489,6 +639,8 @@ def generate_click(
         sched_name = sch_t1
     elif current_tab == 2:
         sched_name = sch_t2
+    elif current_tab == 4:
+        sched_name = sch_t4
     else:
         raise Exception("Unknown tab")
 
@@ -512,6 +664,8 @@ def generate_click(
         scheduler = HeunDiscreteScheduler.from_pretrained(model_path, subfolder="scheduler")
     elif sched_name == "KDPM2" and type(scheduler) is not KDPM2DiscreteScheduler:
         scheduler = KDPM2DiscreteScheduler.from_pretrained(model_path, subfolder="scheduler")
+    elif sched_name == "UniPC" and type(scheduler) is not UniPCMultistepScheduler:
+        scheduler = UniPCMultistepScheduler.from_pretrained(model_path, subfolder="scheduler")
 
     # select which pipeline depending on current tab
     if current_tab == 0:
@@ -658,6 +812,56 @@ def generate_click(
                         scheduler=scheduler)
         current_pipe = "inpaint"
         current_legacy = legacy_t2
+    elif current_tab == 4:
+        if current_pipe != "controlnet" or pipe is None:
+            if controlnet == None:
+                controlnet = OnnxRuntimeModel.from_pretrained(
+                    controlnet_path + "/cnet", provider=provider)
+            
+            if textenc_on_cpu and vaedec_on_cpu:
+                cputextenc = OnnxRuntimeModel.from_pretrained(
+                    model_path + "/text_encoder")
+                cpuvaedec = OnnxRuntimeModel.from_pretrained(
+                    model_path + "/vae_decoder")
+                pipe = OnnxStableDiffusionControlNetPipeline.from_pretrained(
+                    model_path,
+                    provider=provider,
+                    scheduler=scheduler,
+                    text_encoder=cputextenc,
+                    vae_decoder=cpuvaedec,
+                    controlnet=controlnet)
+            elif textenc_on_cpu:
+                cputextenc = OnnxRuntimeModel.from_pretrained(
+                    model_path + "/text_encoder")
+                pipe = OnnxStableDiffusionControlNetPipeline.from_pretrained(
+                    model_path,
+                    provider=provider,
+                    scheduler=scheduler,
+                    text_encoder=cputextenc,
+                    controlnet=controlnet)
+            elif vaedec_on_cpu:
+                cpuvaedec = OnnxRuntimeModel.from_pretrained(
+                    model_path + "/vae_decoder")
+                pipe = OnnxStableDiffusionControlNetPipeline.from_pretrained(
+                    model_path,
+                    provider=provider,
+                    scheduler=scheduler,
+                    vae_decoder=cpuvaedec,
+                    controlnet=controlnet)
+            else:
+                pipe = OnnxStableDiffusionControlNetPipeline.from_pretrained(
+                    model_path,
+                    provider=provider,
+                    scheduler=scheduler,
+                    controlnet=controlnet)
+        else:
+            if controlnet == None:
+                controlnet = OnnxRuntimeModel.from_pretrained(
+                    controlnet_path + "/cnet", provider=provider)
+                pipe.controlnet = None
+                gc.collect()
+                pipe.controlnet = controlnet
+        current_pipe = "controlnet"
 
     # manual garbage collection
     gc.collect()
@@ -670,6 +874,8 @@ def generate_click(
     else:
         safety_checker = lambda images, **kwargs: (images, [False] * len(images))
     pipe.safety_checker = safety_checker
+    if current_pipe == "controlnet":
+        pipe._encode_prompt = functools.partial(lpw_pipe._encode_prompt, pipe)
 
     # run the pipeline with the correct parameters
     if current_tab == 0:
@@ -689,6 +895,7 @@ def generate_click(
             seed_t0,
             fmt_t0,
             None,
+            False,
             False,
         )
     elif current_tab == 1:
@@ -741,6 +948,7 @@ def generate_click(
             fmt_t1,
             None,
             loopback_t1,
+            False,
         )
         pipe.vae_encoder = OnnxRuntimeModel.from_pretrained(
             model_path + "/vae_encoder",provider=provider)
@@ -784,9 +992,49 @@ def generate_click(
             fmt_t2,
             legacy_t2,
             False,
+            False,
         )
         #pipe.vae_encoder = OnnxRuntimeModel.from_pretrained(
         #    model_path + "/vae_encoder",provider=provider)
+    elif current_tab == 4:
+        # input image resizing
+        input_image = image_t4.convert("RGB")
+        input_image = resize_and_crop(input_image, height_t4, width_t4)
+        
+        if steps_t4 > 1000 and (sch_t4 == "DPMS_ms" or "DPMS_ss" or "DEIS"):
+            steps_t4_unreduced = steps_t4
+            steps_t4 = 1000
+            print()
+            print(
+                f"Adjusting steps to account for denoise. From {steps_t4_old} to {steps_t4_unreduced} steps internally."
+            )
+            print()
+            print(
+                f"INTERNAL STEP COUNT EXCEEDS 1000 MAX FOR DPMS_ms, DPMS_ss, or DEIS. INTERNAL STEPS WILL BE REDUCED TO 1000."
+            )
+            print()
+
+        images, status = run_diffusers(
+            prompt_t4,
+            neg_prompt_t4,
+            input_image,
+            None,
+            iter_t4,
+            batch_t4,
+            steps_t4,
+            guid_t4,
+            height_t4,
+            width_t4,
+            eta_t4,
+            0,
+            seed_t4,
+            fmt_t4,
+            None,
+            False,
+            preprocess_t4,
+        )
+        pipe.vae_encoder = OnnxRuntimeModel.from_pretrained(
+            model_path + "/vae_encoder",provider=provider)
 
     if release_memory_after_generation:
         pipe = None
@@ -817,6 +1065,10 @@ def select_tab2():
 def select_tab3():
     global current_tab
     current_tab = 3
+    
+def select_tab4():
+    global current_tab
+    current_tab = 4
 
 
 def choose_sch(sched_name: str):
@@ -846,6 +1098,7 @@ if __name__ == "__main__":
 
     # variables for ONNX pipelines
     model_name = None
+    controlnet_name = None
     provider = "CPUExecutionProvider" if args.cpu_only else "DmlExecutionProvider"
     current_tab = 0
     current_pipe = "txt2img"
@@ -889,6 +1142,14 @@ if __name__ == "__main__":
             if entry.is_dir():
                 model_list.append(entry.name)
     default_model = model_list[0] if len(model_list) > 0 else None
+    
+    controlnet_dir = "controlnet"
+    controlnet_list = []
+    with os.scandir(controlnet_dir) as scan_it:
+        for entry in scan_it:
+            if entry.is_dir():
+                controlnet_list.append(entry.name)
+    default_controlmodel = controlnet_list[0] if len(controlnet_list) > 0 else None
 
     if is_v_0_12:
         from diffusers import (
@@ -897,7 +1158,7 @@ if __name__ == "__main__":
             HeunDiscreteScheduler,
             KDPM2DiscreteScheduler
         )
-        sched_list = ["DPMS_ms", "DPMS_ss", "EulerA", "Euler", "DDIM", "LMS", "PNDM", "DEIS", "HEUN", "KDPM2"]
+        sched_list = ["DPMS_ms", "DPMS_ss", "EulerA", "Euler", "DDIM", "LMS", "PNDM", "DEIS", "HEUN", "KDPM2", "UniPC"]
     else:
         sched_list = ["DPMS_ms", "EulerA", "Euler", "DDIM", "LMS", "PNDM"]
 
@@ -907,6 +1168,7 @@ if __name__ == "__main__":
         with gr.Row():
             with gr.Column(scale=13, min_width=650):
                 model_drop = gr.Dropdown(model_list, value=default_model, label="model folder", interactive=True)
+                controlnet_drop = gr.Dropdown(controlnet_list, value=default_controlmodel, label="controlnet folder", interactive=True)
             with gr.Column(scale=11, min_width=550):
                 with gr.Row():
                     gen_btn = gr.Button("Generate", variant="primary", elem_id="gen_button")
@@ -966,7 +1228,24 @@ if __name__ == "__main__":
                     prompt_t3 = gr.Textbox(value="", lines=2, label="prompt")
                     extras_image = gr.Image(label="input image", type="pil", elem_id="image_extras")
                     danbooru_btn = gr.Button("Deepdanbooru", elem_id="deepdb_button")
+                with gr.Tab(label="controlnet") as tab4:
+                    prompt_t4 = gr.Textbox(value="", lines=2, label="prompt")
+                    neg_prompt_t4 = gr.Textbox(value="", lines=2, label="negative prompt")
+                    sch_t4 = gr.Radio(sched_list, value="DPMS_ms", label="scheduler")
+                    preprocess_t4 = gr.Checkbox(value=False, label="Don't preprocess image")
+                    image_t4 = gr.Image(label="input image", type="pil", elem_id="image_init")
+                    with gr.Row():
+                        iter_t4 = gr.Slider(1, 24, value=1, step=1, label="iteration count")
+                        batch_t4 = gr.Slider(1, 1, value=1, step=1, label="batch size")
+                    steps_t4 = gr.Slider(1, 300, value=16, step=1, label="steps")
+                    guid_t4 = gr.Slider(0, 50, value=7.5, step=0.1, label="guidance")
+                    height_t4 = gr.Slider(192, 1536, value=512, step=64, label="height")
+                    width_t4 = gr.Slider(192, 1536, value=512, step=64, label="width")
+                    eta_t4 = gr.Slider(0, 1, value=0.0, step=0.01, label="DDIM eta", interactive=False)
+                    seed_t4 = gr.Textbox(value="", max_lines=1, label="seed")
+                    fmt_t4 = gr.Radio(["png", "jpg"], value="png", label="image format")
             with gr.Column(scale=11, min_width=550):
+                global image_out
                 image_out = gr.Gallery(value=None, label="output images")
                 status_out = gr.Textbox(value="", label="status")
 
@@ -1021,13 +1300,32 @@ if __name__ == "__main__":
         tab3_inputs = [
             prompt_t3,
         ]
+        tab4_inputs = [
+            prompt_t4,
+            neg_prompt_t4,
+            image_t4,
+            sch_t4,
+            preprocess_t4,
+            iter_t4,
+            batch_t4,
+            steps_t4,
+            guid_t4,
+            height_t4,
+            width_t4,
+            eta_t4,
+            seed_t4,
+            fmt_t4,
+        ]
         all_inputs = [model_drop]
+        all_inputs.extend([controlnet_drop])
         all_inputs.extend(tab0_inputs)
         all_inputs.extend(tab1_inputs)
         all_inputs.extend(tab2_inputs)
         all_inputs.extend(tab3_inputs)
-        all_prompts = [prompt_t0,prompt_t1,prompt_t2,prompt_t3]
+        all_inputs.extend(tab4_inputs)
+        all_prompts = [prompt_t0,prompt_t1,prompt_t2,prompt_t3, prompt_t4]
 
+        extras_image.change(fn=danbooru_click, inputs=[extras_image], outputs=all_prompts)
         clear_btn.click(fn=clear_click, inputs=None, outputs=all_inputs, queue=False)
         gen_btn.click(fn=generate_click, inputs=all_inputs, outputs=[image_out, status_out])
         danbooru_btn.click(fn=danbooru_click, inputs=[extras_image], outputs=all_prompts)
@@ -1036,14 +1334,17 @@ if __name__ == "__main__":
         tab1.select(fn=select_tab1, inputs=None, outputs=None)
         tab2.select(fn=select_tab2, inputs=None, outputs=None)
         tab3.select(fn=select_tab3, inputs=None, outputs=None)
+        tab4.select(fn=select_tab4, inputs=None, outputs=None)
 
         sch_t0.change(fn=choose_sch, inputs=sch_t0, outputs=eta_t0, queue=False)
         sch_t1.change(fn=choose_sch, inputs=sch_t1, outputs=eta_t1, queue=False)
         sch_t2.change(fn=choose_sch, inputs=sch_t2, outputs=eta_t2, queue=False)
+        sch_t4.change(fn=choose_sch, inputs=sch_t2, outputs=eta_t2, queue=False)
 
         image_out.style(grid=2)
         image_t1.style(height=402)
         image_t2.style(height=402)
+        image_t4.style(height=402)
 
     # start gradio web interface on local host
     demo.launch()
