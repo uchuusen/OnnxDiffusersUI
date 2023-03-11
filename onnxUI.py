@@ -65,8 +65,6 @@ def run_diffusers(
     global current_pipe
     global pipe
     global controlnet
-    global callbackcounter
-    callbackcounter = 9
     
     model_path = os.path.join("model", model_name)
 
