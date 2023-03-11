@@ -2,7 +2,9 @@
 <br>**- It detects the type of model it is based on the name of the model directory, so it can choose the correct image preprocessing method.**
 <br>**- Currently supports preprocessing for Canny, Openpose, Scribble, and Depth.**
 <br>**- Optionally you can disable preprocessing and use an already processed image, useful for undetected models, or if you just prefer to use your own scribbles, etc.**
+<br>**- Also replaced Deepdanbooru with WD 1.4 tagger. It's actually good now!**
 
+<br><br>Original readme:
 # OnnxDiffusersUI
 
 I’ve been helping people setup Stable Diffusion and run it on their AMD graphics card (or CPU) on Windows. I’ve also wrote a basic UI for the diffusers library version to make it more user friendly. This guide is a consolidation of what I’ve learned and hopefully will help other people setup their PC to run Stable Diffusion too.
