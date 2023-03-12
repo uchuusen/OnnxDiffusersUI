@@ -1337,7 +1337,7 @@ if __name__ == "__main__":
         sch_t0.change(fn=choose_sch, inputs=sch_t0, outputs=eta_t0, queue=False)
         sch_t1.change(fn=choose_sch, inputs=sch_t1, outputs=eta_t1, queue=False)
         sch_t2.change(fn=choose_sch, inputs=sch_t2, outputs=eta_t2, queue=False)
-        sch_t4.change(fn=choose_sch, inputs=sch_t2, outputs=eta_t2, queue=False)
+        sch_t4.change(fn=choose_sch, inputs=sch_t4, outputs=eta_t4, queue=False)
 
         image_out.style(grid=2)
         image_t1.style(height=402)
